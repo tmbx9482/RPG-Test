@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""
+Turn‑Based Terminal RPG — FF/Persona‑inspired (expanded)
+--------------------------------------------------------
+What’s new in this build:
+• Save / Load / New Game (JSON saves)
+• Party of FIVE (new allies: Mira and Zeph)
+• Two new elements: EARTH and WATER
+• Five new enemies: Stone Golem, Leviathan, Pyro Drake, Storm Harpy, Chaos Knight
+• Longer mini‑campaign to showcase additions
+
+Run:  python rpg.py
+Python: 3.8+
+"""
+from __future__ import annotations
+import json
+import os
+import random
+import sys
+import textwrap
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple
+
+# ---------------------------- UTILITIES ---------------------------- #
+
+def wrap(text: str, width: int = 78) -> str:
+    return "
+".join(textwrap.fill(line, width) for line in text.splitlines())
+
+
+def prompt_choice(prompt: str, options: List[str]) -> int:
+    while True:
+        print(wrap(prompt))
+        for i, opt in enumerate(options, 1):
+            print(f"  {i}. {opt}")
+        choice = input("
+> ").strip()
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(options):
+                return idx
+        print("Invalid choice. Try again.
+")
+
+SAVE_FILE = "shadow_circuit_save.json"
+
+# ---------------------------- CORE TYPES ---------------------------- #
+
+ELEMENTS = [
+    "physical",
+    "fire",
+    "ice",
+    "electric",
+    "wind",
+    "light",
+    "dark",
+    "earth",   # NEW
+    "water",   # NEW
+]
+
+@dataclass
+class Affinity:
+    table: Dict[str, float] = field(default_factory=dict)  # multipliers
+    def mult(self, element: str) -> float:
+        return self.table.get(element, 1.0)
+
+    def to_dict(self):
+        return {"table": self.table}
+    @staticmethod
+    def from_dict(d):
+        return Affinity(d.get("table", {}))
+
+@dataclass
+class Status:
+    name: str
+    duration: int
+    stunned: bool = False
+    attack_down: bool = False
+    defense_down: bool = False
+    def to_dict(self):
+        return asdict(self)
+    @staticmethod
+    def from_dict(d):
+        return Status(**d)
+
+@dataclass
+class Skill:
+    name: str
+    element: str
+    power: int
+    mp_cost: int
+    target_all: bool = False
+    desc: str = ""
+    apply_status: Optional[Tuple[str, int]] = None
+    def is_damage(self) -> bool:
+        return self.element in ELEMENTS and self.power > 0
+    def is_heal(self) -> bool:
+        return self.element == "support" and self.power < 0
+
+# Registry so we can rebuild skills from names on load
+SKILL_INDEX: Dict[str, Skill] = {}
+
+def reg(skill: Skill) -> Skill:
+    SKILL_INDEX[skill.name] = skill
+    return skill
+
+@dataclass
+class Combatant:
+    name: str
+    max_hp: int
+    max_mp: int
+    atk: int
+    defense: int
+    speed: int
+    affinity: Affinity
+    skills: List[Skill]
+    lvl: int = 1
+    hp: int = field(init=False)
+    mp: int = field(init=False)
+    statuses: List[Status] = field(default_factory=list)
+    knocked_down: bool = False
+    limit: int = 0
+
+    def __post_init__(self):
+        self.hp = self.max_hp
+        self.mp = self.max_mp
+
+    def is_alive(self) -> bool:
+        return self.hp > 0
+
+    def has_status(self, name: str) -> Optional[Status]:
+        for s in self.statuses:
+            if s.name == name:
+                return s
+        return None
+
+    def add_status(self, status: Status):
+        existing = self.has_status(status.name)
+        if existing:
+            existing.duration = max(existing.duration, status.duration)
+            existing.stunned |= status.stunned
+            existing.attack_down |= status.attack_down
+            existing.defense_down |= status.defense_down
+        else:
+            self.statuses.append(status)
+
+    def tick_statuses(self):
+        for s in list(self.statuses):
+            s.duration -= 1
+            if s.duration <= 0:
+                self.statuses.remove(s)
+
+    def take_damage(self, amount: int):
+        self.hp = max(0, self.hp - amount)
+        self.limit = min(100, self.limit + max(1, amount // 5))
+
+    def heal(self, amount: int):
+        self.hp = min(self.max_hp, self.hp + amount)
+
+    def spend_mp(self, amount: int) -> bool:
+        if self.mp >= amount:
+            self.mp -= amount
+            return True
+        return False
+
+    # ---- serialization ---- #
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "max_hp": self.max_hp,
+            "max_mp": self.max_mp,
+            "atk": self.atk,
+            "defense": self.defense,
+            "speed": self.speed,
+            "affinity": self.affinity.to_dict(),
+            "skills": [s.name for s in self.skills],
+            "lvl": self.lvl,
+            "hp": self.hp,
+            "mp": self.mp,
+            "statuses": [s.to_dict() for s in self.statuses],
+            "knocked_down": self.knocked_down,
+            "limit": self.limit,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        c = Combatant(
+            name=d["name"], max_hp=d["max_hp"], max_mp=d["max_mp"], atk=d["atk"], defense=d["defense"],
+            speed=d["speed"], affinity=Affinity.from_dict(d["affinity"]), skills=[SKILL_INDEX[n] for n in d["skills"]], lvl=d.get("lvl",1)
+        )
+        c.hp = d.get("hp", c.max_hp)
+        c.mp = d.get("mp", c.max_mp)
+        c.statuses = [Status.from_dict(s) for s in d.get("statuses", [])]
+        c.knocked_down = d.get("knocked_down", False)
+        c.limit = d.get("limit", 0)
+        return c
+
+# ---------------------------- GAME DATA ---------------------------- #
+
+# Skills (including new elements)
+FIRE = reg(Skill("Agi", "fire", power=22, mp_cost=4, desc="Small fire damage to one foe."))
+ICE = reg(Skill("Bufu", "ice", power=22, mp_cost=4, desc="Small ice damage to one foe."))
+ZIO = reg(Skill("Zio", "electric", power=22, mp_cost=4, desc="Small electric damage to one foe."))
+GARU = reg(Skill("Garu", "wind", power=22, mp_cost=4, desc="Small wind damage to one foe."))
+LIGHT = reg(Skill("Hama", "light", power=28, mp_cost=6, desc="Light holy damage to one foe."))
+DARK = reg(Skill("Mudo", "dark", power=28, mp_cost=6, desc="Light dark damage to one foe."))
+CLEAVE = reg(Skill("Cleave", "physical", power=26, mp_cost=0, desc="A solid physical strike."))
+MEDI = reg(Skill("Medi", "support", power=-30, mp_cost=6, target_all=True, desc="Small party heal."))
+DIA = reg(Skill("Dia", "support", power=-45, mp_cost=5, desc="Heal one ally."))
+RAKU = reg(Skill("Rakunda", "support", power=0, mp_cost=6, desc="Defense down on a foe.", apply_status=("defense_down", 3)))
+TARU = reg(Skill("Tarunda", "support", power=0, mp_cost=6, desc="Attack down on a foe.", apply_status=("attack_down", 3)))
+# NEW elemental skills
+TERRA = reg(Skill("Terra", "earth", power=24, mp_cost=5, desc="Small earth damage; good vs flyers."))
+AQUA  = reg(Skill("Aqua", "water", power=24, mp_cost=5, desc="Small water damage; douses fire."))
+
+# Party of FIVE
+HERO = Combatant(
+    name="Parker", max_hp=130, max_mp=42, atk=17, defense=11, speed=13,
+    affinity=Affinity({"electric": 1.5, "ice": 0.5}), skills=[CLEAVE, ZIO, DIA], lvl=1,
+)
+MAGE = Combatant(
+    name="Rin", max_hp=95, max_mp=64, atk=10, defense=8, speed=14,
+    affinity=Affinity({"fire": 0.5, "dark": 1.5}), skills=[FIRE, ICE, MEDI], lvl=1,
+)
+SCOUT = Combatant(
+    name="Kade", max_hp=105, max_mp=36, atk=14, defense=9, speed=18,
+    affinity=Affinity({"wind": 0.5}), skills=[GARU, RAKU, TARU], lvl=1,
+)
+HEALER = Combatant(
+    name="Mira", max_hp=100, max_mp=70, atk=9, defense=9, speed=12,
+    affinity=Affinity({"water": 0.5, "fire": 1.5}), skills=[AQUA, DIA, MEDI], lvl=1,
+)
+TANK = Combatant(
+    name="Zeph", max_hp=150, max_mp=30, atk=18, defense=14, speed=10,
+    affinity=Affinity({"earth": 0.5, "wind": 1.5}), skills=[CLEAVE, TERRA, RAKU], lvl=1,
+)
+
+# Enemies (5 new + some originals)
+SLIME = Combatant(
+    name="Volt Slime", max_hp=75, max_mp=30, atk=12, defense=6, speed=9,
+    affinity=Affinity({"electric": 0.0, "wind": 1.5, "ice": 1.5}), skills=[ZIO, CLEAVE],
+)
+PIXIE = Combatant(
+    name="Frost Pixie", max_hp=60, max_mp=40, atk=10, defense=5, speed=16,
+    affinity=Affinity({"ice": 0.0, "fire": 1.5}), skills=[ICE, DIA],
+)
+STONE_GOLEM = Combatant(
+    name="Stone Golem", max_hp=160, max_mp=25, atk=17, defense=16, speed=7,
+    affinity=Affinity({"earth": 0.0, "water": 1.5, "wind": 1.5, "fire": 0.5}),
+    skills=[TERRA, CLEAVE],
+)
+LEVIATHAN = Combatant(
+    name="Leviathan", max_hp=180, max_mp=60, atk=18, defense=12, speed=12,
+    affinity=Affinity({"water": 0.0, "electric": 1.5, "ice": 0.5}), skills=[AQUA, ICE],
+)
+PYRO_DRAKE = Combatant(
+    name="Pyro Drake", max_hp=140, max_mp=50, atk=19, defense=10, speed=15,
+    affinity=Affinity({"fire": 0.0, "water": 1.5, "ice": 1.5, "wind": 0.5}), skills=[FIRE, CLEAVE],
+)
+STORM_HARPY = Combatant(
+    name="Storm Harpy", max_hp=110, max_mp=45, atk=14, defense=9, speed=20,
+    affinity=Affinity({"wind": 0.0, "electric": 0.5, "earth": 1.5}), skills=[GARU, ZIO],
+)
+CHAOS_KNIGHT = Combatant(
+    name="Chaos Knight", max_hp=200, max_mp=70, atk=21, defense=14, speed=14,
+    affinity=Affinity({"dark": 0.0, "light": 1.5, "fire": 0.5}), skills=[DARK, CLEAVE],
+)
+BOSS = Combatant(
+    name="Shadow Conductor", max_hp=260, max_mp=90, atk=20, defense=13, speed=16,
+    affinity=Affinity({"electric": 0.5, "light": 0.0, "dark": 0.0, "wind": 1.5, "water": 1.5}),
+    skills=[ZIO, DARK, LIGHT, CLEAVE],
+)
+
+# Items
+ITEMS = {
+    "Potion": {"desc": "Restore 50 HP.", "heal": 50},
+    "Ether": {"desc": "Restore 20 MP.", "mp": 20},
+    "Hi-Potion": {"desc": "Restore 120 HP.", "heal": 120},
+}
+
+# ---------------------------- BATTLE SYSTEM ---------------------------- #
+
+class Battle:
+    def __init__(self, party: List[Combatant], foes: List[Combatant]):
+        self.party = party
+        self.foes = foes
+        self.turn_order: List[Combatant] = []
+
+    def build_turn_order(self):
+        alive = [c for c in self.party + self.foes if c.is_alive()]
+        random.shuffle(alive)
+        self.turn_order = sorted(alive, key=lambda c: c.speed, reverse=True)
+
+    def all_enemies_down(self) -> bool:
+        return all(e.knocked_down or not e.is_alive() for e in self.foes)
+
+    def damage_calc(self, user: Combatant, target: Combatant, skill: Skill) -> Tuple[int, float, bool]:
+        base = skill.power + user.atk - target.defense
+        base = max(1, base)
+        mult = target.affinity.mult(skill.element)
+        if target.has_status("defense_down"):
+            base = int(base * 1.25)
+        if user.has_status("attack_down"):
+            base = int(base * 0.75)
+        crit = False
+        if skill.element == "physical" and random.random() < 0.10:
+            base = int(base * 1.5)
+            crit = True
+        dmg = max(1, int(base * mult))
+        # guard halves next incoming hit
+        g = target.has_status("guard")
+        if g:
+            dmg = max(1, dmg // 2)
+            g.duration = 0  # consume
+        return dmg, mult, crit
+
+    def apply_skill(self, user: Combatant, targets: List[Combatant], skill: Skill) -> Tuple[bool, List[str]]:
+        logs: List[str] = []
+        if user.mp < skill.mp_cost:
+            return False, [f"{user.name} tried {skill.name} but lacked MP!"]
+        user.spend_mp(skill.mp_cost)
+
+        granted_one_more = False
+
+        if skill.is_damage():
+            for t in targets:
+                if not t.is_alive():
+                    continue
+                dmg, mult, crit = self.damage_calc(user, t, skill)
+                t.take_damage(dmg)
+                note = []
+                if mult == 0.0:
+                    note.append("NULL/ABSORB!")
+                elif mult > 1.0:
+                    note.append("Weakness!")
+                    t.knocked_down = True
+                    granted_one_more = True
+                elif crit:
+                    note.append("CRIT!")
+                    t.knocked_down = True
+                    granted_one_more = True
+                logs.append(f"{user.name} used {skill.name} on {t.name} for {dmg} dmg. {' '.join(note)}")
+                if not t.is_alive():
+                    logs.append(f"{t.name} is defeated!")
+                if skill.apply_status and t.is_alive():
+                    sname, turns = skill.apply_status
+                    st = Status(sname, duration=turns, defense_down=(sname=="defense_down"), attack_down=(sname=="attack_down"))
+                    t.add_status(st)
+                    logs.append(f"{t.name} is afflicted with {sname.replace('_',' ')} for {turns} turns!")
+        elif skill.is_heal():
+            for t in targets:
+                if not t.is_alive():
+                    continue
+                amount = -skill.power
+                t.heal(amount)
+                logs.append(f"{user.name} cast {skill.name} on {t.name} restoring {amount} HP.")
+        else:
+            for t in targets:
+                if skill.apply_status:
+                    sname, turns = skill.apply_status
+                    st = Status(sname, duration=turns, defense_down=(sname=="defense_down"), attack_down=(sname=="attack_down"))
+                    t.add_status(st)
+                    logs.append(f"{user.name} cast {skill.name}. {t.name} gets {sname.replace('_',' ')} for {turns} turns.")
+        return granted_one_more, logs
+
+    def choose_target(self, candidates: List[Combatant]) -> List[Combatant]:
+        alive = [c for c in candidates if c.is_alive()]
+        if not alive:
+            return []
+        idx = prompt_choice("Choose a target:", [f"{c.name} (HP {c.hp}/{c.max_hp})" for c in alive])
+        return [alive[idx]]
+
+    def choose_skill(self, user: Combatant) -> Optional[Skill]:
+        opts = [f"{s.name} ({s.mp_cost} MP) – {s.desc}" for s in user.skills]
+        idx = prompt_choice("Choose a skill:", opts + ["Back"])
+        if idx == len(opts):
+            return None
+        return user.skills[idx]
+
+    def use_item(self, user: Combatant):
+        names = list(ITEMS.keys())
+        idx = prompt_choice("Choose an item:", [f"{n} – {ITEMS[n]['desc']}" for n in names] + ["Back"])
+        if idx == len(names):
+            return
+        n = names[idx]
+        it = ITEMS[n]
+        t = self.choose_target([c for c in self.party if c.is_alive()])
+        if not t:
+            return
+        target = t[0]
+        if "heal" in it:
+            target.heal(it["heal"])
+            print(f"{user.name} used {n} on {target.name}, restoring {it['heal']} HP!
+")
+        elif "mp" in it:
+            before = target.mp
+            target.mp = min(target.max_mp, target.mp + it["mp"])
+            print(f"{user.name} used {n} on {target.name}, restoring {target.mp - before} MP!
+")
+
+    def try_limit(self, user: Combatant) -> bool:
+        if user.limit < 100:
+            return False
+        answer = prompt_choice(f"{user.name}'s LIMIT is full! Unleash OVERDRIVE?", ["Yes", "No"])
+        if answer == 0:
+            user.limit = 0
+            skill = Skill("OVERDRIVE", "physical", power=45, mp_cost=0, target_all=True, desc="Devastating strike to all foes.")
+            granted, logs = self.apply_skill(user, [e for e in self.foes if e.is_alive()], skill)
+            for l in logs:
+                print(wrap(l))
+            print()
+            return True
+        return False
+
+    def player_turn(self, user: Combatant):
+        if user.knocked_down:
+            print(f"{user.name} is knocked down and wastes a turn getting up!
+")
+            user.knocked_down = False
+            return
+        if self.try_limit(user):
+            return
+        while True:
+            idx = prompt_choice(
+                f"{user.name} (HP {user.hp}/{user.max_hp}, MP {user.mp}/{user.max_mp}) — Choose action:",
+                ["Attack", "Skill", "Item", "Guard", "Inspect"]
+            )
+            if idx == 0:
+                t = self.choose_target(self.foes)
+                if not t:
+                    continue
+                granted, logs = self.apply_skill(user, t, CLEAVE)
+                for l in logs:
+                    print(wrap(l))
+                if granted:
+                    print("ONE MORE! You gain an extra action!
+")
+                    continue
+                break
+            elif idx == 1:
+                s = self.choose_skill(user)
+                if not s:
+                    continue
+                targets = [e for e in self.foes if e.is_alive()] if s.target_all else self.choose_target(self.foes)
+                granted, logs = self.apply_skill(user, targets, s)
+                for l in logs:
+                    print(wrap(l))
+                if s.is_damage() and granted:
+                    print("ONE MORE! You gain an extra action!
+")
+                    continue
+                if self.all_enemies_down():
+                    print("All foes are knocked down! Perform an ALL‑OUT ATTACK?
+")
+                    if prompt_choice("", ["Yes", "No"]) == 0:
+                        self.all_out_attack(user)
+                break
+            elif idx == 2:
+                self.use_item(user)
+                break
+            elif idx == 3:
+                user.add_status(Status("guard", duration=1))
+                print(f"{user.name} braces for impact.
+")
+                break
+            else:
+                self.inspect()
+
+    def enemy_turn(self, user: Combatant):
+        if not user.is_alive():
+            return
+        if user.knocked_down:
+            print(f"{user.name} staggers back up and misses their action.
+")
+            user.knocked_down = False
+            return
+        living_party = [p for p in self.party if p.is_alive()]
+        target = min(living_party, key=lambda p: p.hp)
+        best = None
+        best_score = -1
+        for s in user.skills:
+            if s.is_damage():
+                mult = target.affinity.mult(s.element)
+                score = mult + random.random() * 0.2
+                if score > best_score:
+                    best = s; best_score = score
+        if not best:
+            best = CLEAVE
+        granted, logs = self.apply_skill(user, [target], best)
+        for l in logs:
+            print(wrap(l))
+
+    def all_out_attack(self, initiator: Combatant):
+        dmg = 20 + sum(p.atk for p in self.party if p.is_alive()) // 6
+        for e in self.foes:
+            if e.is_alive():
+                e.take_damage(dmg)
+        print(wrap(f"The party rushes in! ALL‑OUT ATTACK deals {dmg} to all foes!"))
+        for e in self.foes:
+            if e.is_alive() and e.hp == 0:
+                print(f"{e.name} is defeated!")
+        print()
+
+    def inspect(self):
+        print("
+-- Enemy Scan --")
+        for e in self.foes:
+            if not e.is_alive():
+                continue
+            aff = ", ".join(
+                f"{el}:{'W' if e.affinity.mult(el)>1.0 else 'R' if e.affinity.mult(el)<1.0 else 'N'}"
+                for el in ["fire","ice","electric","wind","light","dark","earth","water","physical"]
+            )
+        
+            print(f"{e.name} — HP {e.hp}/{e.max_hp} | Affinities [{aff}]")
+        print()
+
+    def turn_loop(self) -> bool:
+        self.build_turn_order()
+        for actor in self.turn_order:
+            if not actor.is_alive():
+                continue
+            if actor in self.party:
+                print(f"-- {actor.name}'s turn --")
+                self.player_turn(actor)
+            else:
+                print(f"-- {actor.name} (Enemy) acts --")
+                self.enemy_turn(actor)
+            actor.tick_statuses()
+            if all(not e.is_alive() for e in self.foes):
+                return True
+            if all(not p.is_alive() for p in self.party):
+                return False
+        return None
+
+    def run(self) -> bool:
+        print("
+A battle has begun!
+")
+        while True:
+            res = self.turn_loop()
+            if res is True:
+                print("Victory!
+"); return True
+            elif res is False:
+                print("Defeat...
+"); return False
+
+# ---------------------------- SAVE / LOAD ---------------------------- #
+
+def serialize_party(party: List[Combatant]) -> List[dict]:
+    return [c.to_dict() for c in party]
+
+
+def deserialize_party(data: List[dict]) -> List[Combatant]:
+    return [Combatant.from_dict(d) for d in data]
+
+
+def save_game(game_state: dict, path: str = SAVE_FILE):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(game_state, f, indent=2)
+    print(f"Saved game to {path}.
+")
+
+
+def load_game(path: str = SAVE_FILE) -> Optional[dict]:
+    if not os.path.exists(path):
+        print("No save file found.
+"); return None
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    print(f"Loaded game from {path}.
+")
+    return data
+
+# ---------------------------- GAME FLOW ---------------------------- #
+
+class Game:
+    def __init__(self):
+        import copy
+        # default new game state
+        self.party: List[Combatant] = [
+            copy.deepcopy(HERO), copy.deepcopy(MAGE), copy.deepcopy(SCOUT),
+            copy.deepcopy(HEALER), copy.deepcopy(TANK)
+        ]
+        self.chapter: int = 1  # progress marker
+
+    def banner(self):
+        print("""
+=====================================================
+  SHADOW CIRCUIT: FF/Persona‑Style Terminal RPG (v2)
+=====================================================
+""")
+
+    def pause(self):
+        input("(Press Enter)
+")
+
+    def narrate(self, text: str):
+        print(wrap(text) + "
+")
+
+    def choose_member(self) -> Combatant:
+        idx = prompt_choice("Choose a party member:", [f"{p.name} (HP {p.hp}/{p.max_hp}, MP {p.mp}/{p.max_mp})" for p in self.party])
+        return self.party[idx]
+
+    def camp_menu(self):
+        while True:
+            idx = prompt_choice("Camp Menu:", ["Status", "Use Item", "Save", "Load", "Proceed", "Quit Game"])
+            if idx == 0:
+                for p in self.party:
+                    self.narrate(f"{p.name} — LV {p.lvl} | HP {p.hp}/{p.max_hp} | MP {p.mp}/{p.max_mp} | LIMIT {p.limit}%")
+            elif idx == 1:
+                names = list(ITEMS.keys())
+                choice = prompt_choice("Select item:", names + ["Back"])
+                if choice == len(names):
+                    continue
+                member = self.choose_member()
+                it = ITEMS[names[choice]]
+                if "heal" in it:
+                    member.heal(it["heal"])
+                    self.narrate(f"Used {names[choice]} on {member.name}. +{it['heal']} HP.")
+                elif "mp" in it:
+                    before = member.mp
+                    member.mp = min(member.max_mp, member.mp + it["mp"])
+                    self.narrate(f"Used {names[choice]} on {member.name}. +{member.mp - before} MP.")
+            elif idx == 2:  # Save
+                state = {
+                    "chapter": self.chapter,
+                    "party": serialize_party(self.party),
+                }
+                save_game(state)
+            elif idx == 3:  # Load
+                data = load_game()
+                if data:
+                    self.chapter = data.get("chapter", 1)
+                    self.party = deserialize_party(data.get("party", []))
+            elif idx == 4:
+                return
+            else:
+                print("Goodbye!"); sys.exit(0)
+
+    def encounter(self, foes: List[Combatant]) -> bool:
+        import copy
+        battle = Battle(self.party, [copy.deepcopy(f) for f in foes])
+        return battle.run()
+
+    def reward(self):
+        for p in self.party:
+            if p.is_alive():
+                p.hp = min(p.max_hp, p.hp + 25)
+                p.mp = min(p.max_mp, p.mp + 10)
+                p.lvl += 1
+                p.atk += 1; p.defense += 1; p.max_hp += 6; p.max_mp += 2
+        self.narrate("After the fight you feel stronger (+1 level). HP/MP slightly restored.")
+
+    def play_chapter(self):
+        if self.chapter == 1:
+            self.narrate("You wake aboard the abandoned subway—the Shadow Circuit. A voice crackles: 'Find the Conductor.'")
+            self.camp_menu()
+            self.narrate("Car 1: Shades ooze from the vents.")
+            if not self.encounter([SLIME, PIXIE]):
+                self.narrate("Your journey ends here... The shadows swallow the light."); return False
+            self.reward(); self.chapter = 2; self.camp_menu()
+        if self.chapter == 2:
+            self.narrate("Car 2: The ground trembles. Stone hands claw from the floor.")
+            if not self.encounter([STONE_GOLEM]):
+                self.narrate("The weight of the earth buries your hopes."); return False
+            self.reward(); self.chapter = 3; self.camp_menu()
+        if self.chapter == 3:
+            self.narrate("Car 3: Pipes rupture; seawater swirls into a living tide.")
+            if not self.encounter([LEVIATHAN]):
+                self.narrate("The tide drags you under."); return False
+            self.reward(); self.chapter = 4; self.camp_menu()
+        if self.chapter == 4:
+            self.narrate("Car 4: Sparks and wings—predators circle overhead.")
+            if not self.encounter([STORM_HARPY, PYRO_DRAKE]):
+                self.narrate("The sky itself becomes your enemy."); return False
+            self.reward(); self.chapter = 5; self.camp_menu()
+        if self.chapter == 5:
+            self.narrate("Engine Car: A knight of ruin blocks the path, and beyond him, the Conductor.")
+            if not self.encounter([CHAOS_KNIGHT]):
+                self.narrate("Your will shatters against obsidian steel."); return False
+            self.reward(); self.chapter = 6; self.camp_menu()
+        if self.chapter == 6:
+            self.narrate("Final Car: The Shadow Conductor taps the rail—counting your heartbeats.")
+            if not self.encounter([BOSS]):
+                self.narrate("The rhythm stops. So do you."); return False
+            self.narrate("With a thunderous crack, the Shadow Conductor bursts into harmless sparks. The doors open. Dawn breaks.")
+            print("
+*** THE END — Thanks for playing! ***
+")
+            return True
+        return True
+
+    # ---- entry points ---- #
+    def new_game(self):
+        self.__init__()
+        return self.play_chapter()
+
+    def load_from_disk(self):
+        data = load_game()
+        if not data:
+            return False
+        self.chapter = data.get("chapter", 1)
+        self.party = deserialize_party(data.get("party", []))
+        return self.play_chapter()
+
+# ---------------------------- MAIN MENU ---------------------------- #
+
+def main_menu():
+    g = Game()
+    g.banner()
+    while True:
+        choice = prompt_choice("Main Menu:", ["New Game", "Load Game", "Quit"])
+        if choice == 0:
+            g.new_game()
+        elif choice == 1:
+            g.load_from_disk()
+        else:
+            print("Goodbye!")
+            break
+
+if __name__ == "__main__":
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print("
+Exiting game. Bye!")
